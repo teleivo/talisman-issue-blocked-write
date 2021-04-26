@@ -1,61 +1,68 @@
-// This snippet is emulating the part of the code in the talisman scanner
-// https://github.com/thoughtworks/talisman/blob/f6a09e119a1ddae1b3773c3204a1ebe1250e10f0/scanner/scanner.go#L33-L40
-// which causes
-//   talisman --scan
-// to hang. Specifically the getBlobsInCommit function.
+// This snippet is a potential solution to
+// https://github.com/thoughtworks/talisman/issues/301
 package main
 
 import (
 	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
 	"os/exec"
+	"strings"
+	"sync"
 )
 
-// This is a simplification of what the scanner.getBlobsInCommit does. The
-// actual git command that is run does not matter. What matters is that the
-// command that is executed writes bytes to STDOUT. The
-// exec.Command().CombinedOutput() is waiting for the command to finish. The
-// syscall executing the write to STDOUT gets stuck as the pipe buffer that the
-// command is writing to is full, so subsequent write() calls will block until
-// the pipe buffer is read from (drained). All this happens on the OS level,
-// not visible to the Go exec.Command. At least as far as I known.
-//
-// Related documentation to read:
-// man 2 write (tells you that write will block on a full pipe buffer)
-// man 7 pipe (tells you the default pipe buffer size)
 func main() {
-	// the talisman scanner creates as many goroutines as commits; tune this to see when
-	// your machine produces bytes faster than it can read them from the pipe
-	// buffer.
-	commits := 1000
-	blobs := make(chan []byte, commits)
-	for i := 0; i < commits; i++ {
-		go func() {
-			// The commented line shows the git command that is actually
-			// executed in the talisman scanner. Its iterating through all
-			// commits a repos history to gather the tree at that commit
-			// blob, _ := exec.Command("git", "ls-tree", "-r", commit).CombinedOutput()
 
-			// This shows that the error has nothing to do with git itself but
-			// rather the way the command is executed. I am using dd to write
-			// bytes to stdout. You might also have to tune the count based on
-			// your machine.
-			//
-			//   default capacity on my machine is 65,536 bytes
-			//
-			// I chose bs=4096 as running strace on the stuck git ls-tree
-			// showed a write with that amount as the count parameter
-			// I chose count=25 to get a total of > 100k which was the tree
-			// size of some commits that got stuck in the 'git ls-tree -r'.
-			// Less might also suffice.
-			blob, _ := exec.Command("dd", "if=/dev/urandom", "status=none", "bs=4096", "count=25").CombinedOutput()
-			fmt.Printf("len(tree) = %+v\n", len(blob))
-			blobs <- blob
-		}()
+	var wg sync.WaitGroup
+	// if we do not limit the number of concurrent git ls-tree operations we
+	// will open too many files.
+	commits := getAllCommits()
+	trees := make(chan []byte, len(commits))
+	sem := make(chan struct{}, 10) // maximum number git ls-tree that run at any time
+	for _, commit := range commits {
+		wg.Add(2) // TODO wait for both goroutines?
+		go getCommitTree(commit, trees, sem, &wg)
 	}
-	for i := 0; i < commits; i++ {
-		blob := <-blobs
-		_ = blob
-		fmt.Printf("got blob i=%+v\n", i)
+	wg.Wait()
+	fmt.Println("done reading")
+	fmt.Println(string(<-trees)) // print sample
+}
+
+func getAllCommits() []string {
+	// TODO can this be done more efficiently? with -z for nul byte separation
+	// and by passing a reader of sorts where one can range over Fields? like
+	// strings.Fields just for nul byte separator
+	out, err := exec.Command("git", "log", "--all", "--pretty=%H").CombinedOutput()
+	if err != nil {
+		log.Fatal(err)
 	}
-	fmt.Println("done")
+	commits := strings.Split(string(out), "\n")
+	return commits[:len(commits)-1] // the last element is an empty string due to a trailing newline in the output
+}
+
+func getCommitTree(commit string, results chan []byte, sem chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	r, w := io.Pipe()
+	defer w.Close()
+	cmd := exec.Command("git", "ls-tree", "-r", commit)
+	cmd.Stdout = w
+	go func() {
+		defer wg.Done()
+		// TODO can this be done efficiently? ReadAll will probably allocate
+		// a buffer
+		// br := bufio.NewReader(r)
+		// br.ReadBytes(\NUL) // read slice until nul byte which gives one blob
+		// can we just read one blob at a time or is that too slow?
+		// read all of it at once with ioutil.ReadAll() ?
+		b, _ := ioutil.ReadAll(r)
+		results <- b
+	}()
+	sem <- struct{}{}
+	if err := cmd.Run(); err != nil {
+		// TODO handle errors. Also what should we do with the STDERR
+		// output?
+		fmt.Println(err)
+	}
+	<-sem
 }
