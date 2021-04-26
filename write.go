@@ -28,6 +28,7 @@ func main() {
 	// buffer.
 	commits := 1000
 	blobs := make(chan []byte, commits)
+	sem := make(chan struct{}, 10)
 	for i := 0; i < commits; i++ {
 		go func() {
 			// The commented line shows the git command that is actually
@@ -47,9 +48,11 @@ func main() {
 			// I chose count=25 to get a total of > 100k which was the tree
 			// size of some commits that got stuck in the 'git ls-tree -r'.
 			// Less might also suffice.
+			sem <- struct{}{}
 			blob, _ := exec.Command("dd", "if=/dev/urandom", "status=none", "bs=4096", "count=25").CombinedOutput()
 			fmt.Printf("len(tree) = %+v\n", len(blob))
 			blobs <- blob
+			<-sem
 		}()
 	}
 	for i := 0; i < commits; i++ {
